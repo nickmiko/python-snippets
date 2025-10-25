@@ -1,7 +1,5 @@
 import pandas as pd
 
-import argparse  # for parsing command-line arguments
-
 # Class to load any dataset
 class DataLoader:
     def __init__(self, file_path: str):
