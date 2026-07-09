@@ -104,7 +104,10 @@ def _fetch_raw_transactions(
         try:
             team_id: str = first["cells"][0]["teamId"]
             date_str: str = first["cells"][1]["content"]
-            # Uppercase for cross-platform %p compatibility (am/pm → AM/PM)
+            # Normalize to uppercase before parsing: Python's strptime %p is
+            # case-insensitive on CPython/Linux but may be case-sensitive on
+            # Windows or non-glibc platforms, so guard against Fantrax returning
+            # lowercase "am"/"pm" variants.
             date: datetime = datetime.strptime(date_str.upper(), "%a %b %d, %Y, %I:%M%p")
         except (KeyError, ValueError, IndexError):
             continue  # skip transactions with missing or malformed metadata
