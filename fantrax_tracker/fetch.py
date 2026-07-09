@@ -104,7 +104,8 @@ def _fetch_raw_transactions(
         try:
             team_id: str = first["cells"][0]["teamId"]
             date_str: str = first["cells"][1]["content"]
-            date: datetime = datetime.strptime(date_str, "%a %b %d, %Y, %I:%M%p")
+            # Uppercase for cross-platform %p compatibility (am/pm → AM/PM)
+            date: datetime = datetime.strptime(date_str.upper(), "%a %b %d, %Y, %I:%M%p")
         except (KeyError, ValueError, IndexError):
             continue  # skip transactions with missing or malformed metadata
 
@@ -232,7 +233,7 @@ def fetch_team_transactions(
         and any(p.type.upper() in _RAW_TRADE_TYPES for p in tx.players)
     }
 
-    summaries: dict[int, YearSummary] = defaultdict(lambda: YearSummary(year=0))
+    summaries: dict[int, YearSummary] = {}
 
     for tx in all_transactions:
         tx_team_id = tx.team.id if hasattr(tx.team, "id") else str(tx.team)
