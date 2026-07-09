@@ -1,10 +1,10 @@
 # Fantrax Transaction History Tracker
 
-A Python tool that fetches your Fantrax fantasy-sports transaction history and renders it as a visual tree chart — one row per season, showing every add, drop, and trade with colour-coded nodes and connecting lines between trade partners.
+A Python tool that fetches your Fantrax fantasy-sports transaction history and renders it as a visual tree chart — one row per season, showing every add, drop, and trade with colour-coded nodes and connecting lines between trade partners and between a player's acquisition and eventual departure.
 
 ## Example output
 
-The chart produced mirrors the reference image: year labels on the left, player boxes spreading horizontally, and curved lines joining players that were part of the same trade.
+Year labels sit on the left as coloured boxes, one band per season. Player nodes spread out horizontally within each band, and lines trace both trade pairs (who-for-who) and a player's lineage across years (added in 2023, traded away in 2024, for example).
 
 | Colour | Transaction type |
 |--------|-----------------|
@@ -21,11 +21,7 @@ The chart produced mirrors the reference image: year labels on the left, player 
 pip install -r requirements.txt
 ```
 
-For **private leagues** or league-restricted endpoints you also need:
-
-```bash
-pip install selenium webdriver-manager
-```
+`selenium` and `webdriver-manager` (also in requirements.txt) are only used for private-league login — skip them if your league is public.
 
 ---
 
@@ -51,8 +47,7 @@ python main.py \
     --output     my_history.png
 ```
 
-After the first login the session cookie is saved to `fantraxloggedin.cookie`
-in the current directory and reused automatically on subsequent runs.
+After the first login the session cookie is saved to `fantraxloggedin.cookie` in the current directory and reused automatically on subsequent runs, so you only need `--username`/`--password` again if the cookie expires.
 
 ---
 
@@ -78,8 +73,8 @@ in the current directory and reused automatically on subsequent runs.
 fantrax_tracker/
 ├── main.py          # CLI entry point
 ├── auth.py          # Cookie-based auth helper (monkey-patches fantraxapi)
-├── fetch.py         # Fetches and groups transactions by year
-├── chart.py         # Builds and saves the matplotlib chart
+├── fetch.py          # Fetches and groups transactions by year
+├── chart.py          # Builds and saves the matplotlib chart
 └── requirements.txt
 ```
 
@@ -99,9 +94,14 @@ https://www.fantrax.com/fantasy/league/96igs4677sgjk7ol/...
 ## Notes
 
 - The Fantrax API is unofficial and subject to change.
-- `league.transactions(count=N)` fetches the *N* most recent transaction rows.
-  If your league has many years of history, increase `--max` (e.g. `--max 5000`).
-- Trade direction (in vs out) is inferred from which team owns the transaction
-  record.  In rare cases where both sides of a trade appear under a single
-  record the direction may be shown as "trade out" only; re-running after the
-  API is updated will correct this automatically.
+- Claims/drops and trades are fetched as two separate, server-side team-scoped
+  queries (`--max` is a per-view cap), then merged. Each trade row already
+  carries the sending and receiving team directly, so multi-team and N-for-M
+  trades resolve correctly without guessing.
+- Rows referencing a team no longer active in the league, or otherwise malformed,
+  are skipped rather than crashing the fetch — this happens naturally with
+  multi-season history in leagues with roster/ownership changes.
+- A player added and dropped again within the same season, or a multi-player
+  trade, can still land far apart horizontally in the chart even though the
+  connecting line is correct — the layout doesn't try to minimize line length,
+  only to avoid ever overlapping two nodes.

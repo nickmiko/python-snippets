@@ -1,4 +1,4 @@
-"""Fantrax Transaction History Tracker – entry point.
+"""Fantrax Transaction History Tracker - CLI entry point.
 
 Usage
 -----
@@ -9,7 +9,7 @@ Public league (no login required):
         --team       "My Team Name" \\
         --output     my_team_history.png
 
-Private league (cookie-based login):
+Private league (cookie-based login, first run opens headless Chrome):
 
     python main.py \\
         --league-id  96igs4677sgjk7ol \\
@@ -77,15 +77,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
-    # ── Connect to the league ─────────────────────────────────────────────────
     league = League(args.league_id)
 
-    # ── Optional authentication (private league / restricted endpoints) ───────
     if args.username or args.password:
-        _creds = (args.username, args.password)
-        patch_league_auth(league, *_creds)
+        patch_league_auth(league, args.username, args.password)
 
-    # ── Fetch transactions ────────────────────────────────────────────────────
     moves_by_year = fetch_team_transactions(
         league,
         team_name=args.team,
@@ -96,7 +92,6 @@ def main(argv: list[str] | None = None) -> None:
         print("No transactions found. Check your team name and league ID.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Optional year filter ──────────────────────────────────────────────────
     if args.years.strip():
         wanted = {int(y.strip()) for y in args.years.split(",")}
         moves_by_year = {yr: s for yr, s in moves_by_year.items() if yr in wanted}
@@ -104,12 +99,10 @@ def main(argv: list[str] | None = None) -> None:
             print(f"No transactions found for years: {args.years}", file=sys.stderr)
             sys.exit(1)
 
-    # ── Optional drop filter ──────────────────────────────────────────────────
     if args.no_drops:
         for summary in moves_by_year.values():
             summary.drops.clear()
 
-    # ── Print summary ─────────────────────────────────────────────────────────
     print("\n── Transaction Summary ──────────────────────────────────────────")
     for year, summary in sorted(moves_by_year.items()):
         print(
@@ -120,7 +113,6 @@ def main(argv: list[str] | None = None) -> None:
         )
     print()
 
-    # ── Build chart ───────────────────────────────────────────────────────────
     output_path = None if args.output.lower() == "none" else args.output
     build_chart(
         moves_by_year,

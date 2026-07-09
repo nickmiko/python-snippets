@@ -1,10 +1,27 @@
-"""Fetch and process Fantrax transaction history for a specific team.
+"""Fetch and classify Fantrax transaction history for a specific team.
 
-Transaction type constants returned by the API:
-  ADD      – waiver/free-agent add
-  DROP     – drop
-  TRADE    – trade (player either coming in or going out)
-  CLAIM    – raw claim before the claimType is resolved (handled internally)
+fantraxapi's ``League.transactions()`` / ``api.get_transaction_history()``
+call the ``getTransactionDetailsHistory`` endpoint with no ``view`` or
+``team`` filter and assume a fixed cell layout (``cells[0]`` = team,
+``cells[1]`` = date). Neither holds up against a real league:
+
+- The endpoint only returns one transaction category per call. With no
+  ``view`` argument the server defaults to ``CLAIM_DROP`` — trades never
+  come back at all unless you separately request ``view="TRADE"``.
+- Row cell layout depends on transaction type, not a fixed schema. Claim/drop
+  rows carry ``team``/``bid``/``priority``/``date``/``week`` cells (in that
+  order, keyed by ``"key"``); trade rows carry ``from``/``to``/``date``/
+  ``week`` cells instead — there is no ``"team"`` cell at all, and no
+  ``transactionCode`` field either. Indexing by position instead of by
+  ``"key"`` silently mis-parses claim rows and misses trades entirely.
+- A multi-row transaction (e.g. a claim that also drops a player) renders
+  its ``team``/``date``/``from``/``to`` cells only on the first row of the
+  group (an HTML-rowspan artifact) — later rows in the same ``txSetId``
+  omit them.
+
+This module talks to the raw endpoint directly, keyed by ``view``, scoped
+server-side with a ``team`` filter (both trade sides included), and reads
+every cell by its ``"key"`` rather than its position.
 """
 
 from __future__ import annotations
@@ -12,39 +29,37 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 from fantraxapi import League
-from fantraxapi import api as _fantrax_api
+from fantraxapi.api import Method
+from fantraxapi.api import request as fantrax_request
 
-
-# Transaction type constants used throughout the app
 T_ADD = "ADD"
 T_DROP = "DROP"
 T_TRADE_IN = "TRADE_IN"
 T_TRADE_OUT = "TRADE_OUT"
 
-# Raw API codes mapped to our constants
-_RAW_ADD_TYPES = {"WAIVER", "FREE_AGENT", "CLAIM"}
-_RAW_DROP_TYPES = {"DROP"}
-_RAW_TRADE_TYPES = {"TRADE"}
+_VIEW_CLAIM_DROP = "CLAIM_DROP"
+_VIEW_TRADE = "TRADE"
+
+_PAGE_SIZE = 500
 
 
 @dataclass
 class PlayerMove:
-    """A single player movement within one transaction."""
+    """A single player's movement within one transaction."""
 
     player_name: str
     player_id: str
-    move_type: str          # T_ADD / T_DROP / T_TRADE_IN / T_TRADE_OUT
+    move_type: str  # T_ADD / T_DROP / T_TRADE_IN / T_TRADE_OUT
     date: datetime
     year: int
-    tx_id: str             # Links players that share the same transaction
+    tx_id: str  # Shared by every player in the same transaction (links trade partners)
 
 
 @dataclass
 class YearSummary:
-    """All moves for a single season."""
+    """All of a team's moves for a single season."""
 
     year: int
     adds: list[PlayerMove] = field(default_factory=list)
@@ -57,134 +72,115 @@ class YearSummary:
         return self.adds + self.drops + self.trade_ins + self.trade_outs
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lightweight raw-API proxies (avoid fantraxapi constructors that raise
-# NotTeamInLeague / KeyError for historical seasons with roster changes)
-# ──────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class _RawTeam:
-    id: str
+def _cell(row: dict, key: str) -> dict | None:
+    return next((c for c in row.get("cells", []) if c.get("key") == key), None)
 
 
-@dataclass
-class _RawPlayer:
-    name: str
-    id: str
-    type: str
+def _parse_date(date_str: str) -> datetime:
+    # Fantrax renders e.g. "Thu Jul 09, 2026, 10:00AM"; strptime's %p is
+    # case-insensitive on glibc/Linux but not guaranteed elsewhere, so
+    # normalize the am/pm case before parsing.
+    return datetime.strptime(date_str.upper(), "%a %b %d, %Y, %I:%M%p")
 
 
-@dataclass
-class _RawTransaction:
-    id: str
-    team: _RawTeam
-    date: datetime
-    players: list[_RawPlayer]
+def _fetch_view_rows(league: League, view: str, team_id: str, max_transactions: int) -> list[dict]:
+    """Fetch every raw row for one transaction view, scoped to one team.
 
-
-def _fetch_raw_transactions(
-    league: League,
-    max_transactions: int,
-) -> list[_RawTransaction]:
-    """Call the Fantrax API directly and return lightweight transaction objects.
-
-    Unlike :meth:`fantraxapi.League.transactions`, this function skips rows
-    with unknown team IDs or malformed data instead of raising an exception,
-    making it resilient to multi-season leagues where historical transactions
-    may reference teams that are no longer in the current roster.
+    Paginates until either the server reports no more pages or
+    *max_transactions* rows have been collected.
     """
-    response = _fantrax_api.get_transaction_history(league, per_page_results=max_transactions)
-    rows_by_tx: dict[str, list[dict]] = {}
-    for row in response["table"]["rows"]:
-        rows_by_tx.setdefault(row["txSetId"], []).append(row)
+    rows: list[dict] = []
+    page = 1
+    page_size = min(_PAGE_SIZE, max_transactions) or 1
+    while len(rows) < max_transactions:
+        response = fantrax_request(
+            league,
+            Method(
+                "getTransactionDetailsHistory",
+                maxResultsPerPage=str(page_size),
+                view=view,
+                team=team_id,
+                pageNumber=str(page),
+            ),
+        )
+        page_rows = response["table"]["rows"]
+        rows.extend(page_rows)
+        total_pages = response.get("paginatedResultSet", {}).get("totalNumPages", 1)
+        if page >= total_pages or not page_rows:
+            break
+        page += 1
+    return rows[:max_transactions]
 
-    transactions: list[_RawTransaction] = []
-    for tx_id, rows in rows_by_tx.items():
-        first = rows[0]
-        try:
-            team_id: str = first["cells"][0]["teamId"]
-            date_str: str = first["cells"][1]["content"]
-            # Normalize to uppercase before parsing: Python's strptime %p is
-            # case-insensitive on CPython/Linux but may be case-sensitive on
-            # Windows or non-glibc platforms, so guard against Fantrax returning
-            # lowercase "am"/"pm" variants.
-            date: datetime = datetime.strptime(date_str.upper(), "%a %b %d, %Y, %I:%M%p")
-        except (KeyError, ValueError, IndexError):
-            continue  # skip transactions with missing or malformed metadata
 
-        players: list[_RawPlayer] = []
-        for row in rows:
+def _tx_date(tx_rows: list[dict]) -> datetime | None:
+    """Find the transaction date, which only the first row in a group carries."""
+    for row in tx_rows:
+        date_cell = _cell(row, "date")
+        if date_cell and date_cell.get("content"):
             try:
-                scorer = row["scorer"]
-                tc = row.get("transactionCode", "")
-                tx_type = row["claimType"] if tc == "CLAIM" else tc
-                players.append(_RawPlayer(
-                    name=scorer["name"],
-                    id=scorer["scorerId"],
-                    type=tx_type,
-                ))
-            except (KeyError, TypeError):
-                continue  # skip malformed player rows
-
-        if players:
-            transactions.append(_RawTransaction(
-                id=tx_id,
-                team=_RawTeam(id=team_id),
-                date=date,
-                players=players,
-            ))
-
-    return transactions
+                return _parse_date(date_cell["content"])
+            except ValueError:
+                continue
+    return None
 
 
-def _classify(raw_type: str) -> str:
-    """Map a raw API transaction type to ADD, DROP, or TRADE.
-
-    Trade direction (TRADE_IN / TRADE_OUT) is resolved later in
-    ``_process_transaction`` once we know which team owns the record.
-    """
-    up = raw_type.upper()
-    if up in _RAW_ADD_TYPES:
-        return T_ADD
-    if up in _RAW_DROP_TYPES:
-        return T_DROP
-    return "TRADE"  # resolved further in _process_transaction
-
-
-def _process_transaction(
-    tx,
-    our_team_id: str,
-) -> list[PlayerMove]:
-    """Convert one ``Transaction`` object into a list of ``PlayerMove``s."""
+def _moves_from_claim_drop(tx_rows: list[dict], tx_id: str, date: datetime) -> list[PlayerMove]:
     moves: list[PlayerMove] = []
-    tx_team_id: str = tx.team.id if hasattr(tx.team, "id") else str(tx.team)
-
-    for player in tx.players:
-        raw = player.type.upper()
-        if raw in _RAW_TRADE_TYPES:
-            # Determine direction: the transaction is recorded once per trade
-            # partner, so we always have ``tx.team`` as the team *sending* the
-            # players listed.  Players sent *by our team* are TRADE_OUT; players
-            # sent *by the other team* (i.e. received by us) are TRADE_IN.
-            move_type = T_TRADE_OUT if tx_team_id == our_team_id else T_TRADE_IN
-        elif raw in _RAW_ADD_TYPES:
+    for row in tx_rows:
+        code = row.get("transactionCode", "")
+        if code == "CLAIM":
             move_type = T_ADD
-        elif raw in _RAW_DROP_TYPES:
+        elif code == "DROP":
             move_type = T_DROP
         else:
-            # Unknown type – include as an add so it is visible
-            move_type = T_ADD
+            continue  # e.g. lineup-adjacent codes that don't represent a roster add/drop
 
-        moves.append(
-            PlayerMove(
-                player_name=player.name,
-                player_id=player.id,
-                move_type=move_type,
-                date=tx.date,
-                year=tx.date.year,
-                tx_id=tx.id,
+        try:
+            scorer = row["scorer"]
+            moves.append(
+                PlayerMove(
+                    player_name=scorer["name"],
+                    player_id=scorer["scorerId"],
+                    move_type=move_type,
+                    date=date,
+                    year=date.year,
+                    tx_id=tx_id,
+                )
             )
-        )
+        except (KeyError, TypeError):
+            continue
+    return moves
+
+
+def _moves_from_trade(tx_rows: list[dict], tx_id: str, date: datetime, our_team_id: str) -> list[PlayerMove]:
+    moves: list[PlayerMove] = []
+    for row in tx_rows:
+        from_cell = _cell(row, "from")
+        to_cell = _cell(row, "to")
+        if from_cell is None or to_cell is None:
+            continue
+
+        if to_cell.get("teamId") == our_team_id:
+            move_type = T_TRADE_IN
+        elif from_cell.get("teamId") == our_team_id:
+            move_type = T_TRADE_OUT
+        else:
+            continue  # a leg of a multi-team trade that doesn't touch our team
+
+        try:
+            scorer = row["scorer"]
+            moves.append(
+                PlayerMove(
+                    player_name=scorer["name"],
+                    player_id=scorer["scorerId"],
+                    move_type=move_type,
+                    date=date,
+                    year=date.year,
+                    tx_id=tx_id,
+                )
+            )
+        except (KeyError, TypeError):
+            continue
     return moves
 
 
@@ -193,87 +189,81 @@ def fetch_team_transactions(
     team_name: str,
     max_transactions: int = 2000,
 ) -> dict[int, YearSummary]:
-    """Fetch all transactions for a team and return them grouped by year.
+    """Fetch all transactions involving a team, grouped by year.
 
     Args:
-        league: Authenticated ``fantraxapi.League`` instance.
-        team_name: Display name of the fantasy team to filter for (case-
-            insensitive partial match is supported).
-        max_transactions: Upper bound on the number of raw transaction rows to
-            fetch from the API.  Increase if your league has many years of
-            history.
+        league: A ``fantraxapi.League`` instance (already authenticated if
+            the league is private).
+        team_name: Fantasy team name to filter for. Case-insensitive partial
+            match, e.g. ``"Yeti"`` matches ``"The Abominable Yeti"``.
+        max_transactions: Upper bound on raw transaction rows fetched per
+            view (claim/drop and trade are fetched separately). Increase
+            this if your team has many seasons of history and older
+            transactions seem to be missing.
 
     Returns:
-        A dict mapping ``year`` → ``YearSummary`` sorted by year ascending.
+        Dict of year -> YearSummary, sorted ascending by year.
 
     Raises:
-        ValueError: If no team matching *team_name* is found in the league.
+        ValueError: If no team matches *team_name*.
     """
-    # Resolve team ID
     team_name_lower = team_name.lower()
-    our_team = None
+    our_team_id = None
+    our_team_display_name = None
     for tid, team in league.team_lookup.items():
         if team_name_lower in team.name.lower():
-            our_team = team
             our_team_id = tid
+            our_team_display_name = team.name
             break
-    if our_team is None:
-        available = [t.name for t in league.team_lookup.values()]
-        raise ValueError(
-            f"Team '{team_name}' not found. Available teams: {available}"
-        )
+    if our_team_id is None:
+        available = sorted(t.name for t in league.team_lookup.values())
+        raise ValueError(f"Team '{team_name}' not found. Available teams: {available}")
 
-    print(f"Fetching up to {max_transactions} transactions for '{our_team.name}'…")
-    all_transactions = _fetch_raw_transactions(league, max_transactions)
-
-    # First pass: collect tx_ids where our team was a trade participant so we
-    # can identify the counterpart records (the other team's side of the trade,
-    # which carries the players *we received*).
-    our_trade_tx_ids: set[str] = {
-        tx.id
-        for tx in all_transactions
-        if (tx.team.id if hasattr(tx.team, "id") else str(tx.team)) == our_team_id
-        and any(p.type.upper() in _RAW_TRADE_TYPES for p in tx.players)
-    }
+    print(f"Fetching transactions for '{our_team_display_name}'...")
+    claim_drop_rows = _fetch_view_rows(league, _VIEW_CLAIM_DROP, our_team_id, max_transactions)
+    trade_rows = _fetch_view_rows(league, _VIEW_TRADE, our_team_id, max_transactions)
+    print(f"  {len(claim_drop_rows)} claim/drop rows, {len(trade_rows)} trade rows")
 
     summaries: dict[int, YearSummary] = {}
 
-    for tx in all_transactions:
-        tx_team_id = tx.team.id if hasattr(tx.team, "id") else str(tx.team)
-        is_our_tx = tx_team_id == our_team_id
-        is_our_trade_counterpart = (
-            not is_our_tx and tx.id in our_trade_tx_ids
-        )
+    def _summary_for(year: int) -> YearSummary:
+        if year not in summaries:
+            summaries[year] = YearSummary(year=year)
+        return summaries[year]
 
-        # Skip transactions that don't involve our team at all
-        if not is_our_tx and not is_our_trade_counterpart:
-            continue
+    for rows, builder in (
+        (claim_drop_rows, lambda tx_rows, tx_id, date: _moves_from_claim_drop(tx_rows, tx_id, date)),
+        (trade_rows, lambda tx_rows, tx_id, date: _moves_from_trade(tx_rows, tx_id, date, our_team_id)),
+    ):
+        rows_by_tx: dict[str, list[dict]] = defaultdict(list)
+        for row in rows:
+            tx_id = row.get("txSetId")
+            if tx_id:
+                rows_by_tx[tx_id].append(row)
 
-        moves = _process_transaction(tx, our_team_id)
-        for move in moves:
-            year = move.year
-            if year not in summaries:
-                summaries[year] = YearSummary(year=year)
-            summary = summaries[year]
-            if move.move_type == T_ADD:
-                summary.adds.append(move)
-            elif move.move_type == T_DROP:
-                summary.drops.append(move)
-            elif move.move_type == T_TRADE_IN:
-                summary.trade_ins.append(move)
-            elif move.move_type == T_TRADE_OUT:
-                summary.trade_outs.append(move)
+        for tx_id, tx_rows in rows_by_tx.items():
+            date = _tx_date(tx_rows)
+            if date is None:
+                continue  # malformed group; skip rather than guess a date
+            for move in builder(tx_rows, tx_id, date):
+                summary = _summary_for(move.year)
+                if move.move_type == T_ADD:
+                    summary.adds.append(move)
+                elif move.move_type == T_DROP:
+                    summary.drops.append(move)
+                elif move.move_type == T_TRADE_IN:
+                    summary.trade_ins.append(move)
+                elif move.move_type == T_TRADE_OUT:
+                    summary.trade_outs.append(move)
 
     return dict(sorted(summaries.items()))
 
 
-def build_trade_pairs(
-    moves_by_year: dict[int, YearSummary],
-) -> dict[str, list[PlayerMove]]:
-    """Group PlayerMoves by tx_id so trade partners can be drawn together.
+def build_trade_pairs(moves_by_year: dict[int, YearSummary]) -> dict[str, list[PlayerMove]]:
+    """Group every PlayerMove by tx_id so trade partners can be linked visually.
 
     Returns:
-        A dict mapping tx_id → list of PlayerMoves in that transaction.
+        Dict of tx_id -> list of PlayerMoves that share that transaction.
     """
     groups: dict[str, list[PlayerMove]] = defaultdict(list)
     for summary in moves_by_year.values():

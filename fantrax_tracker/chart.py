@@ -1,13 +1,11 @@
-"""Generate a transaction-history tree chart from processed move data.
+"""Render a transaction-history tree chart from processed move data.
 
-The chart matches the style in the reference image:
-  • Year labels as coloured boxes on the left edge; one horizontal band per year.
-  • Each player is a rounded-rect node coloured by transaction type.
-  • Trade partners (TRADE_OUT → TRADE_IN, same tx_id) are connected by vertical
-    lines so the tree flows downward through the years.
-  • Nodes in the same trade transaction are grouped together horizontally so
-    their connecting lines stay short and tidy.
-  • The resulting figure is saved as a PNG (or displayed interactively).
+Matches the reference layout:
+  - One horizontal, colour-banded row per year, with a year label on the left.
+  - Each player move is a rounded-rect node, coloured by transaction type.
+  - Trade partners (TRADE_OUT <-> TRADE_IN sharing a tx_id) are connected.
+  - A player's acquisition (add/trade-in) is connected down to their eventual
+    departure (drop/trade-out) in a later year, forming lineage chains.
 """
 
 from __future__ import annotations
@@ -15,9 +13,9 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Optional
 
-import networkx as nx
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+import networkx as nx
 from matplotlib.patches import FancyBboxPatch
 
 from fetch import (
@@ -30,12 +28,8 @@ from fetch import (
     build_trade_pairs,
 )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Colour / style constants
-# ──────────────────────────────────────────────────────────────────────────────
 YEAR_PALETTE = [
-    "#d0e8d0",  # soft green
+    "#d0e8d0",  # green
     "#fff3cc",  # pale yellow
     "#d0e4f7",  # sky blue
     "#fce4d6",  # peach
@@ -46,47 +40,40 @@ YEAR_PALETTE = [
 ]
 
 TYPE_EDGE_COLOR = {
-    T_ADD:       "#2e7d32",
-    T_DROP:      "#c62828",
-    T_TRADE_IN:  "#b8860b",
+    T_ADD: "#2e7d32",
+    T_DROP: "#c62828",
+    T_TRADE_IN: "#b8860b",
     T_TRADE_OUT: "#8b4513",
 }
 TYPE_FACE_COLOR = {
-    T_ADD:       "#c8e6c9",
-    T_DROP:      "#ffcdd2",
-    T_TRADE_IN:  "#fff9c4",
+    T_ADD: "#c8e6c9",
+    T_DROP: "#ffcdd2",
+    T_TRADE_IN: "#fff9c4",
     T_TRADE_OUT: "#ffe0b2",
 }
 
-# Layout tunables
-NODE_W = 1.5        # node half-width
-NODE_H = 0.28       # node half-height
-H_GAP = 1.8         # minimum horizontal gap between nodes
-V_GAP = 2.4         # vertical gap between year-row centres
+NODE_W = 1.5
+NODE_H = 0.28
+H_GAP = 1.8
+V_GAP = 2.4
 YEAR_LABEL_X = 0.0
 NODE_START_X = 1.4
-
 YEAR_BOX_W = 0.85
 YEAR_BOX_H = 0.40
 CONNECTOR_COLOR = "#aaaaaa"
 CONNECTOR_LW = 0.8
 
-# Within a year band, TRADE_OUT sits slightly above centre and TRADE_IN
-# slightly below, so the TRADE_OUT → TRADE_IN edges are always visible.
+# Offset trade-out/trade-in nodes above/below the year centre so their
+# connecting edge is visibly a short jog rather than overlapping exactly.
 SUB_Y: dict[str, float] = {
-    T_TRADE_OUT:  0.35,   # above year centre
-    T_ADD:        0.0,
-    T_DROP:       0.0,
-    T_TRADE_IN:  -0.35,   # below year centre (connected to by TRADE_OUT)
+    T_TRADE_OUT: 0.35,
+    T_ADD: 0.0,
+    T_DROP: 0.0,
+    T_TRADE_IN: -0.35,
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Name helper
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _wrap_name(name: str, max_chars: int = 14) -> str:
-    """Abbreviate first name to initial when name is long."""
     if len(name) <= max_chars:
         return name
     parts = name.split()
@@ -99,221 +86,170 @@ def _node_key(move: PlayerMove) -> str:
     return f"{move.tx_id}_{move.player_id}_{move.move_type}"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Graph construction
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _build_graph(
     moves_by_year: dict[int, YearSummary],
     trade_pairs: dict[str, list[PlayerMove]],
 ) -> nx.DiGraph:
-    """Build a directed graph where edges represent transaction connections.
+    """Build a directed graph linking related PlayerMove nodes.
 
-    Each node stores the ``PlayerMove`` under key ``'move'``.
-
-    Two kinds of edges are added:
-
-    1. **Within-transaction trade edges** (TRADE_OUT → TRADE_IN, same tx_id):
-       These connect the player sent away with the player(s) received in the
-       same trade, so the tree flows "what did I trade them for?".
-
-    2. **Cross-year lineage edges** (ADD/TRADE_IN → TRADE_OUT/DROP):
-       If a player acquired in year N later departs (trade-out or drop) in
-       year N+k, their acquisition node connects to their departure node.
-       This creates the long vertical chains visible in the reference image
-       where a roster slot's entire history flows downward year by year.
+    Two edge kinds:
+      1. Within-transaction trade edges: TRADE_OUT -> TRADE_IN for the same
+         tx_id, showing what was traded for what.
+      2. Cross-year lineage edges: a player's acquisition (ADD/TRADE_IN)
+         connects down to their later departure (DROP/TRADE_OUT), tracing a
+         roster slot's history year over year.
     """
-    G: nx.DiGraph = nx.DiGraph()
+    graph: nx.DiGraph = nx.DiGraph()
 
     for summary in moves_by_year.values():
         for move in summary.all_moves:
-            key = _node_key(move)
-            G.add_node(key, move=move)
+            graph.add_node(_node_key(move), move=move)
 
-    # ── 1. Within-transaction trade edges ────────────────────────────────────
     for moves_in_tx in trade_pairs.values():
         outs = [m for m in moves_in_tx if m.move_type == T_TRADE_OUT]
-        ins  = [m for m in moves_in_tx if m.move_type == T_TRADE_IN]
+        ins = [m for m in moves_in_tx if m.move_type == T_TRADE_IN]
         for m_out in outs:
             for m_in in ins:
-                k_out = _node_key(m_out)
-                k_in  = _node_key(m_in)
-                if G.has_node(k_out) and G.has_node(k_in):
-                    G.add_edge(k_out, k_in)
+                # kind="trade" edges are drawn but never drive layout (see
+                # _tree_layout): an N-for-M trade wires every out to every
+                # in, so any M > 1 gives multiple trade-in nodes the exact
+                # same predecessor set - deriving position from them would
+                # collapse those nodes onto the same x/y.
+                graph.add_edge(_node_key(m_out), _node_key(m_in), kind="trade")
 
-    # ── 2. Cross-year lineage edges ───────────────────────────────────────────
-    # Walk through every year in order and track the most-recent acquisition
-    # key for each player_id.  When we see that player depart, draw an edge
-    # from their acquisition node to their departure node.
-    last_acq: dict[str, str] = {}  # player_id → node key of latest acquisition
-
+    last_acquisition: dict[str, str] = {}  # player_id -> node key of latest acquisition
     for year in sorted(moves_by_year):
-        summary = moves_by_year[year]
-        # Sort within the year by date so same-day order is deterministic
-        all_moves = sorted(summary.all_moves, key=lambda m: m.date)
-        for move in all_moves:
+        for move in sorted(moves_by_year[year].all_moves, key=lambda m: m.date):
             key = _node_key(move)
             pid = move.player_id
             if move.move_type in (T_ADD, T_TRADE_IN):
-                last_acq[pid] = key
+                last_acquisition[pid] = key
             elif move.move_type in (T_DROP, T_TRADE_OUT):
-                if pid in last_acq:
-                    acq_key = last_acq.pop(pid)
-                    if acq_key != key and G.has_node(acq_key):
-                        G.add_edge(acq_key, key)
+                acq_key = last_acquisition.pop(pid, None)
+                if acq_key and acq_key != key:
+                    # Each player has at most one active acquisition at a
+                    # time, so every node has at most one kind="lineage"
+                    # parent and one such child - a simple chain, never a
+                    # fan-in - which is what makes it safe to use for layout.
+                    graph.add_edge(acq_key, key, kind="lineage")
 
-    return G
+    return graph
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Tree layout
-# ──────────────────────────────────────────────────────────────────────────────
+def _cross_year_lineage(graph: nx.DiGraph, node: str, direction: str) -> list[str]:
+    """kind="lineage" neighbours of *node* that fall in a different year.
 
-def _tree_layout(
-    G: nx.DiGraph,
-    year_y: dict[int, float],
-) -> dict[str, tuple[float, float]]:
-    """Assign (x, y) to every node using a Reingold-Tilford-style algorithm.
+    Same-year lineage edges (added and dropped within one season) are
+    excluded on purpose: T_ADD and T_DROP share the same SUB_Y offset, so a
+    same-year acquisition and departure sit at the same y. If x-derivation
+    also forced them onto the same x (as cross-year pairs correctly do, to
+    draw a clean vertical line down through the years), the two nodes would
+    render at the exact same point, completely overlapping. Excluding them
+    here just means they fall through to the transaction-clustering pass
+    below and get distinct x slots; the edge itself is still drawn.
+    """
+    edges = graph.out_edges(node, data=True) if direction == "out" else graph.in_edges(node, data=True)
+    key_idx = 1 if direction == "out" else 0
+    node_year = graph.nodes[node]["move"].year
+    return [e[key_idx] for e in edges if e[2].get("kind") == "lineage" and graph.nodes[e[key_idx]]["move"].year != node_year]
 
-    The base y-coordinate is fixed by the node's year; a small sub-y offset
-    is added so that TRADE_OUT nodes sit above the year centre and TRADE_IN
-    nodes sit below it — making within-year trade edges clearly visible.
 
-    The x-coordinate is determined recursively so that:
-      • leaves are placed at successive integer slots,
-      • internal nodes are centred over their children,
-      • subtrees never overlap.
+def _tree_layout(graph: nx.DiGraph, year_y: dict[int, float]) -> dict[str, tuple[float, float]]:
+    """Assign (x, y) positions: y from the node's year, x from chain structure.
 
-    Nodes that have no trade-graph connection (plain adds and drops) are placed
-    after all tree-connected nodes, also at successive slots.
+    x-position is derived *only* from cross-year kind="lineage" edges (see
+    _cross_year_lineage): those form simple, non-branching chains, so a
+    node's x is always either a freshly-allocated slot (chain start) or
+    exactly its single child's x (propagated backward up the chain).
+
+    kind="trade" edges are deliberately excluded from this: an N-for-M trade
+    wires every out-node to every in-node, so with M > 1 several trade-in
+    nodes would share the identical predecessor set and derive the identical
+    x - stacking their boxes exactly on top of each other. Trade partners are
+    instead clustered by transaction below, and the trade lines themselves
+    are still drawn afterwards in build_chart() using whatever positions
+    result here - short because same-tx nodes land in adjacent slots, but
+    correct (no two distinct nodes ever share a position) regardless.
     """
     positions: dict[str, tuple[float, float]] = {}
-    slot: list[float] = [0.0]
+    next_slot = [0.0]
 
-    def _y(move: PlayerMove) -> float:
+    def y_of(move: PlayerMove) -> float:
         return year_y[move.year] + SUB_Y.get(move.move_type, 0.0)
 
-    def _place(node: str) -> float:
-        """Return the x-coordinate assigned to *node*."""
-        children = list(G.successors(node))
-        if not children:
-            x = slot[0]
-            slot[0] += 1.0
+    def place_chain(node: str) -> float:
+        if node in positions:
+            return positions[node][0]
+        children = _cross_year_lineage(graph, node, "out")
+        if children:
+            x = place_chain(children[0])  # at most one, by construction
         else:
-            child_xs = [_place(c) for c in children]
-            x = (child_xs[0] + child_xs[-1]) / 2.0
-
-        move: PlayerMove = G.nodes[node]["move"]
-        positions[node] = (x, _y(move))
+            x = next_slot[0]
+            next_slot[0] += 1.0
+        positions[node] = (x, y_of(graph.nodes[node]["move"]))
         return x
 
-    # Process trade-chain roots first (no incoming edges, has outgoing)
-    roots_trade = [
-        n for n in G.nodes
-        if G.in_degree(n) == 0 and G.out_degree(n) > 0
-    ]
-    for root in roots_trade:
-        _place(root)
+    chain_starts = [n for n in graph.nodes if not _cross_year_lineage(graph, n, "in")]
+    for node in chain_starts:
+        if _cross_year_lineage(graph, node, "out"):
+            place_chain(node)
 
-    # Isolated nodes (adds / drops / standalone with no graph edges) grouped
-    # by year so same-year nodes stay together in the layout
-    isolated = [n for n in G.nodes if G.degree(n) == 0]
-    by_year: dict[int, list[str]] = defaultdict(list)
-    for n in isolated:
-        year = G.nodes[n]["move"].year
-        by_year[year].append(n)
-
-    for year in sorted(by_year):
-        for n in by_year[year]:
-            move: PlayerMove = G.nodes[n]["move"]
-            positions[n] = (slot[0], _y(move))
-            slot[0] += 1.0
-
-    # Catch any remaining orphan nodes
-    for n in G.nodes:
+    # Everything else (trade-only nodes and standalone adds/drops) is
+    # clustered by transaction so trade partners land in adjacent slots,
+    # grouped left-to-right by year for a chronological flow.
+    remaining_by_year: dict[int, list[str]] = defaultdict(list)
+    for n in graph.nodes:
         if n not in positions:
-            move: PlayerMove = G.nodes[n]["move"]
-            positions[n] = (slot[0], _y(move))
-            slot[0] += 1.0
+            remaining_by_year[graph.nodes[n]["move"].year].append(n)
 
-    # Scale x by H_GAP and shift right to clear the year-label column
-    return {
-        k: (NODE_START_X + x * H_GAP, y)
-        for k, (x, y) in positions.items()
-    }
+    for year in sorted(remaining_by_year):
+        nodes = remaining_by_year[year]
+        nodes.sort(key=lambda n: (graph.nodes[n]["move"].tx_id, graph.nodes[n]["move"].date))
+        for n in nodes:
+            positions[n] = (next_slot[0], y_of(graph.nodes[n]["move"]))
+            next_slot[0] += 1.0
+
+    return {k: (NODE_START_X + x * H_GAP, y) for k, (x, y) in positions.items()}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Drawing helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _draw_year_label(
-    ax,
-    x: float,
-    y: float,
-    year: int,
-    color: str,
-) -> None:
-    box = FancyBboxPatch(
-        (x - YEAR_BOX_W / 2, y - YEAR_BOX_H / 2),
-        YEAR_BOX_W,
-        YEAR_BOX_H,
-        boxstyle="round,pad=0.05",
-        linewidth=1.2,
-        edgecolor="#888888",
-        facecolor=color,
-        zorder=3,
+def _draw_year_label(ax, x: float, y: float, year: int, color: str) -> None:
+    ax.add_patch(
+        FancyBboxPatch(
+            (x - YEAR_BOX_W / 2, y - YEAR_BOX_H / 2),
+            YEAR_BOX_W,
+            YEAR_BOX_H,
+            boxstyle="round,pad=0.05",
+            linewidth=1.2,
+            edgecolor="#888888",
+            facecolor=color,
+            zorder=3,
+        )
     )
-    ax.add_patch(box)
-    ax.text(
-        x, y, str(year),
-        ha="center", va="center",
-        fontsize=8, fontweight="bold",
-        zorder=4,
-    )
+    ax.text(x, y, str(year), ha="center", va="center", fontsize=8, fontweight="bold", zorder=4)
 
 
 def _draw_node(ax, x: float, y: float, move: PlayerMove) -> None:
-    face = TYPE_FACE_COLOR[move.move_type]
-    edge = TYPE_EDGE_COLOR[move.move_type]
-    label = _wrap_name(move.player_name)
-
-    box = FancyBboxPatch(
-        (x - NODE_W / 2, y - NODE_H / 2),
-        NODE_W,
-        NODE_H,
-        boxstyle="round,pad=0.04",
-        linewidth=0.9,
-        edgecolor=edge,
-        facecolor=face,
-        zorder=3,
+    ax.add_patch(
+        FancyBboxPatch(
+            (x - NODE_W / 2, y - NODE_H / 2),
+            NODE_W,
+            NODE_H,
+            boxstyle="round,pad=0.04",
+            linewidth=0.9,
+            edgecolor=TYPE_EDGE_COLOR[move.move_type],
+            facecolor=TYPE_FACE_COLOR[move.move_type],
+            zorder=3,
+        )
     )
-    ax.add_patch(box)
-    ax.text(
-        x, y, label,
-        ha="center", va="center",
-        fontsize=5.5,
-        zorder=4,
-    )
+    ax.text(x, y, _wrap_name(move.player_name), ha="center", va="center", fontsize=5.5, zorder=4)
 
 
-def _draw_edge(
-    ax,
-    pos_parent: tuple[float, float],
-    pos_child: tuple[float, float],
-) -> None:
-    """Draw an elbow connector from the bottom of the parent to the top of the child.
-
-    When the parent and child share the same year band (same base y), the
-    sub-y offsets ensure y1 > y2, so the connector is a short vertical
-    down-and-back jog that is always clearly visible.
-    """
+def _draw_edge(ax, pos_parent: tuple[float, float], pos_child: tuple[float, float]) -> None:
     x1, y1 = pos_parent
     x2, y2 = pos_child
-    # Start at bottom of parent node, end at top of child node
     y_start = y1 - NODE_H
-    y_end   = y2 + NODE_H
-    mid_y   = (y_start + y_end) / 2.0
+    y_end = y2 + NODE_H
+    mid_y = (y_start + y_end) / 2.0
     ax.plot(
         [x1, x1, x2, x2],
         [y_start, mid_y, mid_y, y_end],
@@ -323,10 +259,6 @@ def _draw_edge(
         zorder=1,
     )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Public API
-# ──────────────────────────────────────────────────────────────────────────────
 
 def build_chart(
     moves_by_year: dict[int, YearSummary],
@@ -340,27 +272,21 @@ def build_chart(
     Args:
         moves_by_year: Output of ``fetch.fetch_team_transactions()``.
         team_name: Used in the chart title.
-        output_path: File path for the saved PNG.  ``None`` skips saving.
-        show: If ``True``, call ``plt.show()`` after rendering.
+        output_path: PNG file path to save to, or None to skip saving.
+        show: If True, open an interactive window after rendering.
         dpi: Resolution of the saved image.
     """
     if not moves_by_year:
         print("No transaction data to plot.")
         return
 
-    years = sorted(moves_by_year.keys())
+    years = sorted(moves_by_year)
     trade_pairs = build_trade_pairs(moves_by_year)
+    year_y = {year: -idx * V_GAP for idx, year in enumerate(years)}
 
-    # ── Year → y-coordinate mapping ───────────────────────────────────────────
-    year_y: dict[int, float] = {
-        year: -idx * V_GAP for idx, year in enumerate(years)
-    }
+    graph = _build_graph(moves_by_year, trade_pairs)
+    positions = _tree_layout(graph, year_y)
 
-    # ── Build graph & compute layout ──────────────────────────────────────────
-    G = _build_graph(moves_by_year, trade_pairs)
-    positions = _tree_layout(G, year_y)
-
-    # ── Figure sizing ─────────────────────────────────────────────────────────
     xs = [p[0] for p in positions.values()]
     ys = [p[1] for p in positions.values()]
     fig_w = max(20, (max(xs) - NODE_START_X) + 4) if xs else 20
@@ -369,64 +295,41 @@ def build_chart(
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(
-        f"{team_name} — Transaction History",
-        fontsize=13, fontweight="bold", pad=14,
-    )
+    ax.set_title(f"{team_name} — Transaction History", fontsize=13, fontweight="bold", pad=14)
 
-    # ── Year background bands ─────────────────────────────────────────────────
-    # Each band spans ±(V_GAP/2 + max_sub_y) around the year centre so that
-    # the sub-y-offset nodes (TRADE_OUT/IN) still fall inside the band.
     x_min = YEAR_LABEL_X - YEAR_BOX_W
-    x_max = max(xs) + NODE_W if xs else 20
+    x_max = (max(xs) + NODE_W) if xs else 20
     half_band = V_GAP / 2 + max(abs(v) for v in SUB_Y.values()) + NODE_H + 0.05
     for idx, year in enumerate(years):
         y_center = year_y[year]
         color = YEAR_PALETTE[idx % len(YEAR_PALETTE)]
-        band = mpatches.FancyBboxPatch(
-            (x_min, y_center - half_band),
-            x_max - x_min,
-            half_band * 2,
-            boxstyle="square,pad=0",
-            linewidth=0,
-            facecolor=color,
-            alpha=0.18,
-            zorder=0,
+        ax.add_patch(
+            mpatches.FancyBboxPatch(
+                (x_min, y_center - half_band),
+                x_max - x_min,
+                half_band * 2,
+                boxstyle="square,pad=0",
+                linewidth=0,
+                facecolor=color,
+                alpha=0.18,
+                zorder=0,
+            )
         )
-        ax.add_patch(band)
+        _draw_year_label(ax, YEAR_LABEL_X, y_center, year, color)
 
-    # ── Year labels ───────────────────────────────────────────────────────────
-    for idx, year in enumerate(years):
-        color = YEAR_PALETTE[idx % len(YEAR_PALETTE)]
-        _draw_year_label(ax, YEAR_LABEL_X, year_y[year], year, color)
-
-    # ── Edges ─────────────────────────────────────────────────────────────────
-    for parent, child in G.edges():
+    for parent, child in graph.edges():
         if parent in positions and child in positions:
             _draw_edge(ax, positions[parent], positions[child])
 
-    # ── Player nodes ──────────────────────────────────────────────────────────
     for node, (x, y) in positions.items():
-        move: PlayerMove = G.nodes[node]["move"]
-        _draw_node(ax, x, y, move)
+        _draw_node(ax, x, y, graph.nodes[node]["move"])
 
-    # ── Legend ────────────────────────────────────────────────────────────────
     legend_items = [
-        mpatches.Patch(facecolor=TYPE_FACE_COLOR[T_ADD],       edgecolor=TYPE_EDGE_COLOR[T_ADD],       label="Add"),
-        mpatches.Patch(facecolor=TYPE_FACE_COLOR[T_DROP],      edgecolor=TYPE_EDGE_COLOR[T_DROP],      label="Drop"),
-        mpatches.Patch(facecolor=TYPE_FACE_COLOR[T_TRADE_IN],  edgecolor=TYPE_EDGE_COLOR[T_TRADE_IN],  label="Trade In"),
-        mpatches.Patch(facecolor=TYPE_FACE_COLOR[T_TRADE_OUT], edgecolor=TYPE_EDGE_COLOR[T_TRADE_OUT], label="Trade Out"),
+        mpatches.Patch(facecolor=TYPE_FACE_COLOR[t], edgecolor=TYPE_EDGE_COLOR[t], label=label)
+        for t, label in [(T_ADD, "Add"), (T_DROP, "Drop"), (T_TRADE_IN, "Trade In"), (T_TRADE_OUT, "Trade Out")]
     ]
-    ax.legend(
-        handles=legend_items,
-        loc="upper right",
-        fontsize=8,
-        framealpha=0.9,
-        title="Transaction Type",
-        title_fontsize=8,
-    )
+    ax.legend(handles=legend_items, loc="upper right", fontsize=8, framealpha=0.9, title="Transaction Type", title_fontsize=8)
 
-    # ── Axis limits ───────────────────────────────────────────────────────────
     if xs and ys:
         margin_x = H_GAP
         margin_y = V_GAP * 0.7
@@ -443,4 +346,3 @@ def build_chart(
         plt.show()
 
     plt.close(fig)
-
