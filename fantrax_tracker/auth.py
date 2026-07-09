@@ -35,6 +35,39 @@ def _load_cookie(session: Session, cookie_file: str) -> None:
             session.cookies.set(cookie["name"], cookie["value"])
 
 
+def import_cookie_header(cookie_header: str, cookie_file: str = COOKIE_FILE) -> int:
+    """Save a raw browser ``Cookie:`` request header as the login cookie file.
+
+    An alternative to the Selenium login flow for environments where a
+    Selenium-drivable Chrome/Chromium isn't available (e.g. Chrome installed
+    only via Flatpak, whose sandboxed launcher isn't a real binary ChromeDriver
+    can start).
+
+    To get the header: log into Fantrax normally in any browser, open
+    DevTools' Network tab, reload, click any request to fantrax.com, and copy
+    the full value of the "Cookie" request header. Using the request header
+    (rather than ``document.cookie``) matters because Fantrax's session
+    cookie is typically ``httpOnly`` and so invisible to page JavaScript -
+    the request header is exactly what the browser actually sends and always
+    includes it.
+
+    Returns:
+        The number of cookies parsed and saved.
+    """
+    cookies = []
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        cookies.append({"name": name.strip(), "value": value.strip()})
+    if not cookies:
+        raise ValueError("No cookies found in that string - expected \"name1=value1; name2=value2\" format.")
+    with open(cookie_file, "wb") as f:
+        pickle.dump(cookies, f)
+    return len(cookies)
+
+
 def _login_and_save_cookie(session: Session, username: str, password: str, cookie_file: str) -> None:
     """Drive a headless Chrome login and persist the resulting session cookie."""
     from selenium import webdriver
@@ -75,8 +108,12 @@ def _login_and_save_cookie(session: Session, username: str, password: str, cooki
             session.cookies.set(cookie["name"], cookie["value"])
 
 
-def patch_league_auth(league, username: str = "", password: str = "", cookie_file: str = COOKIE_FILE) -> None:
+def patch_league_auth(username: str = "", password: str = "", cookie_file: str = COOKIE_FILE) -> None:
     """Monkey-patch ``fantraxapi.api.request`` so requests auto-authenticate.
+
+    Must be called *before* constructing any ``League`` - the constructor
+    itself makes an authenticated request (``getFantasyLeagueInfo``), so
+    patching afterward is too late to catch it.
 
     On the first unauthenticated request this loads a saved cookie if one
     exists, or logs in via Selenium and saves a fresh cookie otherwise. If a
@@ -84,7 +121,6 @@ def patch_league_auth(league, username: str = "", password: str = "", cookie_fil
     it discards the stale cookie, re-logs in, and retries once.
 
     Args:
-        league: A ``fantraxapi.League`` instance.
         username: Fantrax login e-mail, required if no valid cookie is saved.
         password: Fantrax password, required if no valid cookie is saved.
         cookie_file: Path to the pickle file used to cache the session cookie.

@@ -72,6 +72,14 @@ SUB_Y: dict[str, float] = {
     T_TRADE_IN: -0.35,
 }
 
+# A season with heavy transaction volume can put hundreds of nodes in one
+# row; beyond a few hundred, the resulting PNG width exceeds what many image
+# viewers/browsers can render (a common canvas/texture limit is ~16k-32k px).
+# Wrapping keeps every row's node count - and so the image width - bounded
+# regardless of how much history a league has.
+MAX_COLS_PER_ROW = 26
+SUBROW_GAP = 1.4
+
 
 def _wrap_name(name: str, max_chars: int = 14) -> str:
     if len(name) <= max_chars:
@@ -212,6 +220,45 @@ def _tree_layout(graph: nx.DiGraph, year_y: dict[int, float]) -> dict[str, tuple
     return {k: (NODE_START_X + x * H_GAP, y) for k, (x, y) in positions.items()}
 
 
+def _subrow_count(node_count: int, max_cols: int = MAX_COLS_PER_ROW) -> int:
+    return max(1, -(-node_count // max_cols))  # ceil division
+
+
+def _wrap_positions(
+    positions: dict[str, tuple[float, float]],
+    graph: nx.DiGraph,
+    year_base_y: dict[int, float],
+    max_cols: int = MAX_COLS_PER_ROW,
+) -> dict[str, tuple[float, float]]:
+    """Re-flow each year's nodes onto as many sub-rows as needed so no row
+    exceeds *max_cols* nodes wide, then rescale x/y accordingly.
+
+    Cross-year lineage lines are no longer guaranteed perfectly vertical
+    once a year wraps - a node can land in a different sub-row than its
+    counterpart in the adjacent year. The connecting line still draws
+    correctly between wherever the two nodes end up, just with a visible
+    jog instead of a straight drop, which is an acceptable trade-off for
+    keeping the image at a renderable width regardless of transaction volume.
+    """
+    by_year: dict[int, list[str]] = defaultdict(list)
+    for n in graph.nodes:
+        by_year[graph.nodes[n]["move"].year].append(n)
+
+    wrapped: dict[str, tuple[float, float]] = {}
+    for year, nodes in by_year.items():
+        # Original x (from _tree_layout) preserves chronological/structural
+        # order - reuse it purely as a sort key, not as the final position.
+        nodes.sort(key=lambda n: positions[n][0])
+        for rank, n in enumerate(nodes):
+            col = rank % max_cols
+            subrow = rank // max_cols
+            move = graph.nodes[n]["move"]
+            x = NODE_START_X + col * H_GAP
+            y = year_base_y[year] - subrow * SUBROW_GAP + SUB_Y.get(move.move_type, 0.0)
+            wrapped[n] = (x, y)
+    return wrapped
+
+
 def _draw_year_label(ax, x: float, y: float, year: int, color: str) -> None:
     ax.add_patch(
         FancyBboxPatch(
@@ -282,15 +329,33 @@ def build_chart(
 
     years = sorted(moves_by_year)
     trade_pairs = build_trade_pairs(moves_by_year)
+    # A placeholder, evenly-spaced year_y is enough for _tree_layout: it only
+    # feeds x-derivation there (see _wrap_positions), not the final render y.
     year_y = {year: -idx * V_GAP for idx, year in enumerate(years)}
 
     graph = _build_graph(moves_by_year, trade_pairs)
     positions = _tree_layout(graph, year_y)
 
+    # Real render y-spacing: each year's band needs room for as many
+    # sub-rows as its node count requires once wrapped at MAX_COLS_PER_ROW.
+    node_counts = defaultdict(int)
+    for n in graph.nodes:
+        node_counts[graph.nodes[n]["move"].year] += 1
+    subrow_counts = {year: _subrow_count(node_counts[year]) for year in years}
+    band_pad = max(abs(v) for v in SUB_Y.values()) + NODE_H + 0.05
+    year_base_y: dict[int, float] = {}
+    cursor = 0.0
+    for year in years:
+        year_base_y[year] = cursor
+        year_span = (subrow_counts[year] - 1) * SUBROW_GAP + 2 * band_pad
+        cursor -= year_span + (V_GAP - 2 * band_pad)
+
+    positions = _wrap_positions(positions, graph, year_base_y)
+
     xs = [p[0] for p in positions.values()]
     ys = [p[1] for p in positions.values()]
     fig_w = max(20, (max(xs) - NODE_START_X) + 4) if xs else 20
-    fig_h = max(8, len(years) * V_GAP + 2)
+    fig_h = max(8, (max(ys) - min(ys) if ys else 0) + 4)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.set_aspect("equal")
@@ -299,15 +364,16 @@ def build_chart(
 
     x_min = YEAR_LABEL_X - YEAR_BOX_W
     x_max = (max(xs) + NODE_W) if xs else 20
-    half_band = V_GAP / 2 + max(abs(v) for v in SUB_Y.values()) + NODE_H + 0.05
     for idx, year in enumerate(years):
-        y_center = year_y[year]
+        top_y = year_base_y[year] + band_pad
+        bottom_y = year_base_y[year] - (subrow_counts[year] - 1) * SUBROW_GAP - band_pad
+        y_center = (top_y + bottom_y) / 2.0
         color = YEAR_PALETTE[idx % len(YEAR_PALETTE)]
         ax.add_patch(
             mpatches.FancyBboxPatch(
-                (x_min, y_center - half_band),
+                (x_min, bottom_y),
                 x_max - x_min,
-                half_band * 2,
+                top_y - bottom_y,
                 boxstyle="square,pad=0",
                 linewidth=0,
                 facecolor=color,

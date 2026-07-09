@@ -18,14 +18,23 @@ Private league (cookie-based login, first run opens headless Chrome):
         --password   secret \\
         --output     my_team_history.png
 
+Multiple seasons (Fantrax assigns a new league ID each year unless it's a
+dynasty/keeper league, so charting several years usually means several IDs -
+find them via Fantrax's season switcher / league history):
+
+    python main.py \\
+        --league-id  idFor2024,idFor2025,idFor2026 \\
+        --team       "My Team Name" \\
+        --output     my_team_history.png
+
 Options
 -------
---league-id   Fantrax league ID (required).
+--league-id   Fantrax league ID, or several comma-separated (one per season) (required).
 --team        Partial or full fantasy team name (case-insensitive, required).
 --username    Fantrax login e-mail (needed for private leagues).
 --password    Fantrax password (needed for private leagues).
 --output      Output PNG file path (default: transaction_history.png).
---max         Maximum number of raw transaction rows to fetch (default: 2000).
+--max         Maximum number of raw transaction rows to fetch per league (default: 2000).
 --show        Open the chart in a window after saving.
 --years       Comma-separated list of years to include, e.g. 2022,2023,2024.
               Omit to include all available years.
@@ -35,13 +44,14 @@ Options
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from fantraxapi import League
 
-from auth import patch_league_auth
+from auth import COOKIE_FILE, patch_league_auth
 from chart import build_chart
-from fetch import fetch_team_transactions
+from fetch import fetch_team_transactions, merge_year_summaries
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,7 +59,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="fantrax_tracker",
         description="Build a visual transaction-history chart for your Fantrax team.",
     )
-    parser.add_argument("--league-id", required=True, help="Fantrax league ID")
+    parser.add_argument(
+        "--league-id",
+        required=True,
+        help="Fantrax league ID, or comma-separated IDs (one per season)",
+    )
     parser.add_argument("--team", required=True, help="Fantasy team name (partial match OK)")
     parser.add_argument("--username", default="", help="Fantrax login e-mail (private leagues)")
     parser.add_argument("--password", default="", help="Fantrax password (private leagues)")
@@ -77,16 +91,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
-    league = League(args.league_id)
+    if args.username or args.password or os.path.exists(COOKIE_FILE):
+        patch_league_auth(args.username, args.password)
 
-    if args.username or args.password:
-        patch_league_auth(league, args.username, args.password)
-
-    moves_by_year = fetch_team_transactions(
-        league,
-        team_name=args.team,
-        max_transactions=args.max_transactions,
-    )
+    league_ids = [lid.strip() for lid in args.league_id.split(",") if lid.strip()]
+    per_league_summaries = []
+    for league_id in league_ids:
+        league = League(league_id)
+        per_league_summaries.append(
+            fetch_team_transactions(
+                league,
+                team_name=args.team,
+                max_transactions=args.max_transactions,
+                tx_prefix=f"{league_id}:",
+            )
+        )
+    moves_by_year = merge_year_summaries(*per_league_summaries)
 
     if not moves_by_year:
         print("No transactions found. Check your team name and league ID.", file=sys.stderr)

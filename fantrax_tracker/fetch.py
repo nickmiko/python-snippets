@@ -188,6 +188,7 @@ def fetch_team_transactions(
     league: League,
     team_name: str,
     max_transactions: int = 2000,
+    tx_prefix: str = "",
 ) -> dict[int, YearSummary]:
     """Fetch all transactions involving a team, grouped by year.
 
@@ -200,6 +201,13 @@ def fetch_team_transactions(
             view (claim/drop and trade are fetched separately). Increase
             this if your team has many seasons of history and older
             transactions seem to be missing.
+        tx_prefix: Prepended to every tx_id. Fantrax assigns a new league ID
+            each season for non-dynasty leagues, so charting multiple seasons
+            means fetching from several League instances and merging the
+            results (see ``merge_year_summaries``) - tx_ids are only unique
+            *within* one league's API responses, so without a per-league
+            prefix, two different seasons' transactions could collide on the
+            same tx_id and get incorrectly treated as one transaction.
 
     Returns:
         Dict of year -> YearSummary, sorted ascending by year.
@@ -237,9 +245,9 @@ def fetch_team_transactions(
     ):
         rows_by_tx: dict[str, list[dict]] = defaultdict(list)
         for row in rows:
-            tx_id = row.get("txSetId")
-            if tx_id:
-                rows_by_tx[tx_id].append(row)
+            raw_tx_id = row.get("txSetId")
+            if raw_tx_id:
+                rows_by_tx[f"{tx_prefix}{raw_tx_id}"].append(row)
 
         for tx_id, tx_rows in rows_by_tx.items():
             date = _tx_date(tx_rows)
@@ -257,6 +265,23 @@ def fetch_team_transactions(
                     summary.trade_outs.append(move)
 
     return dict(sorted(summaries.items()))
+
+
+def merge_year_summaries(*sources: dict[int, YearSummary]) -> dict[int, YearSummary]:
+    """Combine several year->YearSummary maps (e.g. one per season's league ID).
+
+    Returns:
+        A single dict of year -> YearSummary, sorted ascending by year.
+    """
+    merged: dict[int, YearSummary] = {}
+    for source in sources:
+        for year, summary in source.items():
+            target = merged.setdefault(year, YearSummary(year=year))
+            target.adds.extend(summary.adds)
+            target.drops.extend(summary.drops)
+            target.trade_ins.extend(summary.trade_ins)
+            target.trade_outs.extend(summary.trade_outs)
+    return dict(sorted(merged.items()))
 
 
 def build_trade_pairs(moves_by_year: dict[int, YearSummary]) -> dict[str, list[PlayerMove]]:

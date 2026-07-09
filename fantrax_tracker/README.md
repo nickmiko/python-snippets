@@ -49,13 +49,36 @@ python main.py \
 
 After the first login the session cookie is saved to `fantraxloggedin.cookie` in the current directory and reused automatically on subsequent runs, so you only need `--username`/`--password` again if the cookie expires.
 
+### Multiple seasons
+
+Unless your league is a persistent dynasty/keeper league, Fantrax issues a **new league ID every season** — last year's history lives under a different ID than this year's. Find prior-season IDs via Fantrax's season switcher / league history link, then pass them all comma-separated:
+
+```bash
+python main.py \
+    --league-id  idFor2024,idFor2025,idFor2026 \
+    --team       "My Team Name" \
+    --output     my_history.png
+```
+
+Each ID is fetched (and authenticated, if needed) independently and merged into one chart spanning every season, with lineage lines connecting a player's journey across the season boundary. If your login cookie/credentials work for one season they'll work for all of them, since Fantrax logins aren't scoped to a single league.
+
+### Private league, no Selenium-drivable browser available
+
+The `--username`/`--password` flow needs Selenium to drive a real Chrome/Chromium binary. If your only install is via Flatpak, Selenium can't launch it (the Flatpak launcher isn't a real executable ChromeDriver can start). Import a cookie from any browser instead:
+
+```bash
+python import_cookie.py
+```
+
+It prompts for the `Cookie` request header value (DevTools → Network tab → any `fantrax.com` request → Headers). See `import_cookie.py`'s docstring for the full steps. Once imported, run `main.py` with no `--username`/`--password` — it reuses the saved cookie the same way the Selenium flow does.
+
 ---
 
 ## All options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--league-id` | *(required)* | Fantrax league ID (from the URL) |
+| `--league-id` | *(required)* | Fantrax league ID, or comma-separated IDs (one per season) |
 | `--team` | *(required)* | Your fantasy team name (partial match, case-insensitive) |
 | `--username` | `""` | Fantrax login e-mail (private leagues only) |
 | `--password` | `""` | Fantrax password (private leagues only) |
@@ -71,8 +94,9 @@ After the first login the session cookie is saved to `fantraxloggedin.cookie` in
 
 ```
 fantrax_tracker/
-├── main.py          # CLI entry point
-├── auth.py          # Cookie-based auth helper (monkey-patches fantraxapi)
+├── main.py           # CLI entry point
+├── auth.py           # Cookie-based auth helper (monkey-patches fantraxapi)
+├── import_cookie.py  # One-time manual cookie import (Selenium alternative)
 ├── fetch.py          # Fetches and groups transactions by year
 ├── chart.py          # Builds and saves the matplotlib chart
 └── requirements.txt
@@ -105,3 +129,7 @@ https://www.fantrax.com/fantasy/league/96igs4677sgjk7ol/...
   trade, can still land far apart horizontally in the chart even though the
   connecting line is correct — the layout doesn't try to minimize line length,
   only to avoid ever overlapping two nodes.
+- A season with heavy transaction volume wraps onto multiple sub-rows (rather
+  than one arbitrarily wide row) so the image stays within the pixel-dimension
+  limits most viewers and browsers support. Lineage lines crossing a wrap
+  point show as a jog instead of a straight vertical drop — expected, not a bug.

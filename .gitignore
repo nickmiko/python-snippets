@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# fantrax_tracker: saved login session and generated chart output
+fantrax_tracker/*.cookie
+fantrax_tracker/*.png
