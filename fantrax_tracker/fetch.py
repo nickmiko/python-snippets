@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Optional
 
 from fantraxapi import League
+from fantraxapi import api as _fantrax_api
 
 
 # Transaction type constants used throughout the app
@@ -54,6 +55,82 @@ class YearSummary:
     @property
     def all_moves(self) -> list[PlayerMove]:
         return self.adds + self.drops + self.trade_ins + self.trade_outs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lightweight raw-API proxies (avoid fantraxapi constructors that raise
+# NotTeamInLeague / KeyError for historical seasons with roster changes)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _RawTeam:
+    id: str
+
+
+@dataclass
+class _RawPlayer:
+    name: str
+    id: str
+    type: str
+
+
+@dataclass
+class _RawTransaction:
+    id: str
+    team: _RawTeam
+    date: datetime
+    players: list[_RawPlayer]
+
+
+def _fetch_raw_transactions(
+    league: League,
+    max_transactions: int,
+) -> list[_RawTransaction]:
+    """Call the Fantrax API directly and return lightweight transaction objects.
+
+    Unlike :meth:`fantraxapi.League.transactions`, this function skips rows
+    with unknown team IDs or malformed data instead of raising an exception,
+    making it resilient to multi-season leagues where historical transactions
+    may reference teams that are no longer in the current roster.
+    """
+    response = _fantrax_api.get_transaction_history(league, per_page_results=max_transactions)
+    rows_by_tx: dict[str, list[dict]] = {}
+    for row in response["table"]["rows"]:
+        rows_by_tx.setdefault(row["txSetId"], []).append(row)
+
+    transactions: list[_RawTransaction] = []
+    for tx_id, rows in rows_by_tx.items():
+        first = rows[0]
+        try:
+            team_id: str = first["cells"][0]["teamId"]
+            date_str: str = first["cells"][1]["content"]
+            date: datetime = datetime.strptime(date_str, "%a %b %d, %Y, %I:%M%p")
+        except (KeyError, ValueError, IndexError):
+            continue  # skip transactions with missing or malformed metadata
+
+        players: list[_RawPlayer] = []
+        for row in rows:
+            try:
+                scorer = row["scorer"]
+                tc = row.get("transactionCode", "")
+                tx_type = row["claimType"] if tc == "CLAIM" else tc
+                players.append(_RawPlayer(
+                    name=scorer["name"],
+                    id=scorer["scorerId"],
+                    type=tx_type,
+                ))
+            except (KeyError, TypeError):
+                continue  # skip malformed player rows
+
+        if players:
+            transactions.append(_RawTransaction(
+                id=tx_id,
+                team=_RawTeam(id=team_id),
+                date=date,
+                players=players,
+            ))
+
+    return transactions
 
 
 def _classify(raw_type: str) -> str:
@@ -143,7 +220,7 @@ def fetch_team_transactions(
         )
 
     print(f"Fetching up to {max_transactions} transactions for '{our_team.name}'…")
-    all_transactions = league.transactions(count=max_transactions)
+    all_transactions = _fetch_raw_transactions(league, max_transactions)
 
     # First pass: collect tx_ids where our team was a trade participant so we
     # can identify the counterpart records (the other team's side of the trade,
