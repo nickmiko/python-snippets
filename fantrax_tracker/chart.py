@@ -10,15 +10,11 @@ The chart mirrors the style in the reference image:
 
 from __future__ import annotations
 
-import math
-import textwrap
 from collections import defaultdict
 from typing import Optional
 
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
-import networkx as nx
 from matplotlib.patches import FancyBboxPatch
 
 from fetch import (

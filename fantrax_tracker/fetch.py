@@ -56,22 +56,11 @@ class YearSummary:
         return self.adds + self.drops + self.trade_ins + self.trade_outs
 
 
-def _classify(raw_type: str, team_id: str, transaction_team_id: str) -> str:
-    """Map a raw API transaction type to our simplified constants.
+def _classify(raw_type: str) -> str:
+    """Map a raw API transaction type to ADD, DROP, or TRADE.
 
-    For TRADE rows, the API does not distinguish incoming vs outgoing by a
-    separate field – all players in the transaction belong to the same
-    ``Transaction.team``.  We therefore expose every player as ``TRADE`` and
-    let the caller decide direction by comparing ``Transaction.team`` with the
-    team-under-analysis.  The logic below handles the two-team scenario:
-
-    * All TRADE players whose transaction owner IS our team ⟹ they were
-      **sent away** (TRADE_OUT).
-    * All TRADE players whose transaction owner is NOT our team ⟹ they were
-      **received** (TRADE_IN).
-
-    This function only handles ADD / DROP here; trade direction is resolved in
-    ``_process_transaction``.
+    Trade direction (TRADE_IN / TRADE_OUT) is resolved later in
+    ``_process_transaction`` once we know which team owns the record.
     """
     up = raw_type.upper()
     if up in _RAW_ADD_TYPES:
@@ -156,23 +145,28 @@ def fetch_team_transactions(
     print(f"Fetching up to {max_transactions} transactions for '{our_team.name}'…")
     all_transactions = league.transactions(count=max_transactions)
 
+    # First pass: collect tx_ids where our team was a trade participant so we
+    # can identify the counterpart records (the other team's side of the trade,
+    # which carries the players *we received*).
+    our_trade_tx_ids: set[str] = {
+        tx.id
+        for tx in all_transactions
+        if (tx.team.id if hasattr(tx.team, "id") else str(tx.team)) == our_team_id
+        and any(p.type.upper() in _RAW_TRADE_TYPES for p in tx.players)
+    }
+
     summaries: dict[int, YearSummary] = defaultdict(lambda: YearSummary(year=0))
 
     for tx in all_transactions:
         tx_team_id = tx.team.id if hasattr(tx.team, "id") else str(tx.team)
-
-        # We want transactions that INVOLVE our team.  In the Fantrax API each
-        # trade generates two Transaction objects – one per team – so we'll
-        # see our team's record directly.  For adds/drops the team must match.
         is_our_tx = tx_team_id == our_team_id
+        is_our_trade_counterpart = (
+            not is_our_tx and tx.id in our_trade_tx_ids
+        )
 
-        # For trade transactions we also need the *counterpart* record (the
-        # transaction where the other team is the owner but our team received
-        # players).  The API unfortunately does not expose who received the
-        # trade – only who sent the players.  We detect this by checking
-        # whether the trade already has a matching partner recorded.
-        if not is_our_tx:
-            continue  # only process transactions owned by our team for now
+        # Skip transactions that don't involve our team at all
+        if not is_our_tx and not is_our_trade_counterpart:
+            continue
 
         moves = _process_transaction(tx, our_team_id)
         for move in moves:
